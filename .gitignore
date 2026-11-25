@@ -1,0 +1,13 @@
+# Python environment and caches
+.venv/
+__pycache__/
+
+# Generated when you run things (rebuilt by seed.py / FinGuard)
+bank.db
+finguard_audit.jsonl
+finguard_pending.json
+
+# Editor / OS clutter
+.vscode/
+.DS_Store
+Thumbs.db
