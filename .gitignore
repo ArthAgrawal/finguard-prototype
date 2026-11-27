@@ -4,6 +4,9 @@ __pycache__/
 
 # Generated when you run things (rebuilt by seed.py / FinGuard)
 bank.db
+data/*.db
+data/test/
+results/
 finguard_audit.jsonl
 finguard_pending.json
 

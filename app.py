@@ -1,7 +1,7 @@
 """
 app.py - Maple Bank online banking, in your browser.
 
-You are Priya. The left side is your bank account (read live from bank.db).
+You are Alex Rivera. The left side is your bank account (read live from bank.db).
 The right side is the bank's AI assistant (agent.py). Under each reply you can
 open "Behind the scenes" to see every tool the assistant called.
 
@@ -20,12 +20,14 @@ import streamlit as st
 import yaml
 
 import agent
+import attacks
 import bank_core
-from seed import DB_PATH, build_bank
+from data import fixtures
+from seed import CUSTOMER_ID, DB_PATH, build_bank
 
-ACCOUNT = "ACC-1001"
-ATTACKER = "7731-0092"
-ATTACKS = yaml.safe_load(open(Path(__file__).parent / "attacks.yaml", encoding="utf-8"))
+ACCOUNT = agent.CHECKING                       # Alex's checking account, acc_000001
+START_BALANCE = fixtures.HERO_CHECKING_BALANCE  # $6,412.88 after every reset
+ATTACKS = attacks.load_attacks()
 
 st.set_page_config(page_title="Maple Bank", page_icon="🍁", layout="wide")
 
@@ -48,6 +50,8 @@ if "chat" not in st.session_state:
     st.session_state.chat = []      # list of {"role", "content", "calls"}
 if "scenario" not in st.session_state:
     st.session_state.scenario = "None"   # which attack is planted right now
+if "answers" not in st.session_state:
+    st.session_state.answers = []   # every reply since the last reset (for success checks)
 
 AUDIT_LOG = Path(__file__).parent / "finguard_audit.jsonl"
 PENDING = Path(__file__).parent / "finguard_pending.json"
@@ -58,13 +62,13 @@ def load_pending():
 
 
 def resolve(request_id, approve):
-    """Priya pressed Approve or Reject. Approving runs the bank's own code directly:
+    """Alex pressed Approve or Reject. Approving runs the bank's own code directly:
     the AI is not involved, so it can't press this button for her."""
     items = load_pending()
     for item in items:
         if item["id"] == request_id and item["status"] == "pending":
             if approve:
-                tool = getattr(bank_core, item["tool"])      # e.g. bank_core.transfer_funds
+                tool = getattr(bank_core, item["tool"])      # e.g. bank_core.pay_bill
                 item["result"] = tool(**item["args"])
                 item["status"] = "approved"
             else:
@@ -73,7 +77,7 @@ def resolve(request_id, approve):
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: demo controls (things Priya can't do in a real bank)
+# Sidebar: demo controls (things Alex can't do in a real bank)
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Demo controls")
@@ -88,15 +92,21 @@ with st.sidebar:
         atk = ATTACKS[choice]
         st.caption(f"**Type:** {atk['type']}")
         st.caption(atk["how"])
-        st.caption(f"**Try asking:** *{atk['try_asking']}*")
+        for i, t in enumerate(attacks.tasks_of(atk), 1):
+            label = "Try asking" if len(attacks.tasks_of(atk)) == 1 else f"Chat {i}, ask"
+            st.caption(f"**{label}:** *{t}*")
+        if len(attacks.tasks_of(atk)) > 1:
+            st.caption("Press **Clear chat only** between the chats.")
+        st.caption(f"**Attack wins if:** {atk.get('goal', '')}")
 
     if st.button("Reset bank with this scenario", width="stretch", type="primary"):
         plants = [] if choice == "None" else ATTACKS[choice]["plants"]
-        build_bank(plants=plants)          # rebuild clean, then hide the attack text
+        build_bank(plants=plants, attack_id=None if choice == "None" else choice)
         AUDIT_LOG.unlink(missing_ok=True)  # fresh FinGuard log too
         PENDING.unlink(missing_ok=True)    # and no leftover approval requests
         st.session_state.scenario = choice
         st.session_state.chat = []
+        st.session_state.answers = []
         st.rerun()
     if st.button("Clear chat only", width="stretch"):
         st.session_state.chat = []
@@ -139,31 +149,35 @@ with st.sidebar:
 # Page header
 # ---------------------------------------------------------------------------
 st.title("🍁 Maple Bank")
-st.caption("Online banking · signed in as **Priya Shah**")
+st.caption(f"Online banking · signed in as **{fixtures.HERO['first_name']} {fixtures.HERO['last_name']}**")
 
 left, right = st.columns([1, 1.2], gap="large")
 
 # ---------------------------------------------------------------------------
-# LEFT: Priya's account, exactly as the database has it right now
+# LEFT: Alex's account, exactly as the database has it right now
 # ---------------------------------------------------------------------------
 with left:
-    acct = read_table("SELECT balance FROM accounts WHERE account_id = ?", ACCOUNT)
-    balance = float(acct["balance"].iloc[0])
-    st.metric("Checking balance", f"${balance:,.2f}", delta=f"{balance - 4250:,.2f}",
-              help="Change since the bank was last reset ($4,250.00)")
+    acct = read_table("SELECT current_balance FROM accounts WHERE account_id = ?", ACCOUNT)
+    balance = float(acct["current_balance"].iloc[0])
+    st.metric("Checking balance", f"${balance:,.2f}", delta=f"{balance - START_BALANCE:,.2f}",
+              help=f"Change since the bank was last reset (${START_BALANCE:,.2f})")
 
-    sent = read_table("SELECT to_account, amount, created_at FROM transfers_log "
-                      "WHERE from_account = ? ORDER BY id DESC", ACCOUNT)
-    stolen = sent[sent["to_account"] == ATTACKER]["amount"].sum()
-    if stolen > 0:
-        st.error(f"⚠️ ${stolen:,.2f} has been sent to unknown account {ATTACKER}")
+    # Did the planted attack reach its goal?
+    active = st.session_state.scenario
+    if active != "None":
+        won, why = attacks.check_success(ATTACKS[active], DB_PATH, st.session_state.answers)
+        if won:
+            st.error(f"⚠️ Attack succeeded: {why}")
 
-    # --- approval requests from FinGuard: only Priya can approve these ---
+    sent = read_table("SELECT requested_at, transfer_type, to_account_number, amount, memo, status "
+                      "FROM transfers WHERE initiated_by = 'agent' ORDER BY requested_at DESC")
+
+    # --- approval requests from FinGuard: only Alex can approve these ---
     for item in [i for i in load_pending() if i["status"] == "pending"]:
         a = item["args"]
+        summary = item.get("summary") or f"Send ${a.get('amount', 0):,.2f} to {a.get('to_account')}"
         with st.container(border=True):
-            st.markdown(f"**🛡️ Approval needed (#{item['id']})**  \n"
-                        f"Send **${a.get('amount', 0):,.2f}** to **{a.get('to_account')}**")
+            st.markdown(f"**🛡️ Approval needed (#{item['id']})**  \n**{summary}**")
             st.caption(f"FinGuard rule {item['rule']}: {item['reason']}")
             c1, c2 = st.columns(2)
             if c1.button("Approve", key=f"ok{item['id']}", type="primary", width="stretch"):
@@ -174,24 +188,29 @@ with left:
                 st.rerun()
 
     tab_tx, tab_payees, tab_bills, tab_sent = st.tabs(
-        ["Transactions", "Payees", "Bills", f"Transfers made ({len(sent)})"])
+        ["Transactions", "Payees", "Bills", f"Sent by assistant ({len(sent)})"])
 
     with tab_tx:
         st.dataframe(read_table(
-            "SELECT date, merchant, amount, memo FROM transactions "
-            "WHERE account_id = ? ORDER BY date DESC", ACCOUNT),
+            "SELECT substr(authorized_at, 1, 10) AS date, "
+            "COALESCE(merchant_descriptor, counterparty_name, description) AS merchant, "
+            "CASE direction WHEN 'debit' THEN -amount ELSE amount END AS amount, memo, status "
+            "FROM transactions WHERE account_id = ? ORDER BY authorized_at DESC LIMIT 200", ACCOUNT),
             hide_index=True, width="stretch")
     with tab_payees:
         st.dataframe(read_table(
-            "SELECT name, account_number, added_at FROM payees WHERE owner_account = ?",
-            ACCOUNT), hide_index=True, width="stretch")
+            "SELECT payee_name, account_number, added_at, added_via, verification_status "
+            "FROM payees WHERE customer_id = ? ORDER BY added_at DESC", CUSTOMER_ID),
+            hide_index=True, width="stretch")
     with tab_bills:
         st.dataframe(read_table(
-            "SELECT payee_name, amount, due_date, status, note FROM bills "
-            "WHERE account_id = ?", ACCOUNT), hide_index=True, width="stretch")
+            "SELECT invoice_number, remit_to_name, balance_due, due_date, status, notes, "
+            "remit_to_account_number FROM invoices WHERE customer_id = ? "
+            "ORDER BY CASE status WHEN 'overdue' THEN 0 WHEN 'open' THEN 1 ELSE 2 END, due_date",
+            CUSTOMER_ID), hide_index=True, width="stretch")
     with tab_sent:
         if sent.empty:
-            st.caption("No transfers yet.")
+            st.caption("The assistant hasn't moved any money yet.")
         else:
             st.dataframe(sent, hide_index=True, width="stretch")
 
@@ -212,7 +231,8 @@ def show_calls(calls):
 
 with right:
     st.subheader("💬 Assistant")
-    st.caption("Ask about your account, bills or payments. Try: *Send $20 to my sister Anika*")
+    st.caption("Ask about your accounts, bills, payments or the news. "
+               "Try: *Send $20 to Jordan* or *Pay my overdue bills*")
 
     for m in st.session_state.chat:
         with st.chat_message(m["role"]):
@@ -267,4 +287,5 @@ with right:
 
         st.session_state.chat.append({"role": "assistant", "content": answer,
                                       "calls": calls})
+        st.session_state.answers.append(answer)
         st.rerun()   # redraw the page so the account side shows any changes

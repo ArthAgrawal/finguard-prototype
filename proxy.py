@@ -21,6 +21,8 @@ One run of the agent = one session = one fresh memory (new_payees, etc.).
 
 import asyncio
 import json
+import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,20 +33,38 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.lowlevel import Server
 
+import bank_core
 import detector
 
 HERE = Path(__file__).parent
 AUDIT_LOG = HERE / "finguard_audit.jsonl"
 PENDING = HERE / "finguard_pending.json"    # actions waiting for the customer's approval
 
-# The real servers FinGuard protects (later: add market_news.py here)
+# The real servers FinGuard protects. They get the same environment as this proxy,
+# so they see the agent's session id (FG_SESSION) and the signed-in customer.
 DOWNSTREAM = {
-    "bank-core": StdioServerParameters(command=sys.executable,
-                                       args=[str(HERE / "bank_core.py")]),
+    "bank-core": StdioServerParameters(command=sys.executable, args=[str(HERE / "bank_core.py")],
+                                       env=dict(os.environ)),
+    "market-news": StdioServerParameters(command=sys.executable, args=[str(HERE / "market_news.py")],
+                                         env=dict(os.environ)),
 }
 
-# Which fields hold text written by OUTSIDERS (the only text we need to scan)
-OUTSIDE_TEXT_FIELDS = {"memo", "note", "merchant", "headline", "body", "payee_name", "name"}
+
+def outside_text_fields():
+    """Which fields hold text written by OUTSIDERS (the only text we need to scan).
+    Read from data/schema.sql, where every attacker-controllable column is marked INJ,
+    so a new table or column is covered as soon as it is marked there."""
+    fields = {"memo", "note", "merchant", "headline", "body", "payee_name", "name"}   # old names
+    schema = HERE / "data" / "schema.sql"
+    if schema.exists():
+        for line in schema.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"\s*(\w+)\s+TEXT\b.*--.*\bINJ\b", line)
+            if m:
+                fields.add(m.group(1))
+    return fields
+
+
+OUTSIDE_TEXT_FIELDS = outside_text_fields()
 
 AMOUNT_LIMIT = 1000.0   # FinGuard's own rule. The bank itself has no limit (on purpose).
 
@@ -69,8 +89,12 @@ def queue_for_approval(name, args, rule, reason):
     """Save an action for the customer to approve or reject in the banking app."""
     items = json.loads(PENDING.read_text(encoding="utf-8")) if PENDING.exists() else []
     request_id = len(items) + 1
+    if name == "pay_bill":
+        summary = f"Pay bill {args.get('invoice_id')} (${bill_amount(str(args.get('invoice_id'))):,.2f})"
+    else:
+        summary = f"Send ${float(args.get('amount', 0) or 0):,.2f} to {args.get('to_account')}"
     items.append({"id": request_id, "tool": name, "args": args, "rule": rule,
-                  "reason": reason, "status": "pending",
+                  "reason": reason, "summary": summary, "status": "pending",
                   "created": datetime.now().isoformat(timespec="seconds")})
     PENDING.write_text(json.dumps(items, indent=2), encoding="utf-8")
     return request_id
@@ -79,17 +103,37 @@ def queue_for_approval(name, args, rule, reason):
 # ---------------------------------------------------------------------------
 # Step 1: policy rules (checked BEFORE a call reaches the bank)
 # ---------------------------------------------------------------------------
+def digits(s):
+    """'7731-0092' and '77310092' are the same account number."""
+    return re.sub(r"\D", "", str(s))
+
+
+def bill_amount(invoice_id):
+    """How much a pay_bill call would send (FinGuard reads the bank's records, read-only)."""
+    rows = bank_core.query("SELECT balance_due FROM invoices WHERE invoice_id = ? OR invoice_number = ?",
+                           invoice_id, invoice_id)
+    return float(rows[0]["balance_due"]) if rows else 0.0
+
+
 def check_policy(name, args):
     """Return (decision, rule_id, reason). decision: ALLOW, BLOCK or CONFIRM."""
     if name == "transfer_funds":
         to = str(args.get("to_account", ""))
         amount = float(args.get("amount", 0) or 0)
-        if to in session["new_payees"]:
+        if digits(to) and digits(to) in session["new_payees"]:
             return ("BLOCK", "POL-NEW-PAYEE",
                     f"payment to {to}, a payee added in this same session")
         if amount > AMOUNT_LIMIT:
             return ("CONFIRM", "POL-AMOUNT-CAP",
                     f"transfers over ${AMOUNT_LIMIT:,.0f} need the customer's confirmation")
+    if name == "pay_bill":
+        amount = bill_amount(str(args.get("invoice_id", "")))
+        if amount > AMOUNT_LIMIT:
+            return ("CONFIRM", "POL-AMOUNT-CAP",
+                    f"bill payments over ${AMOUNT_LIMIT:,.0f} need the customer's confirmation "
+                    f"(this one is ${amount:,.2f})")
+        # KNOWN GAP (on purpose, for now): FinGuard does not yet compare the account printed
+        # on the bill with the vendor's account on file. Attack A4 tests exactly this.
     return ("ALLOW", None, "")
 
 
@@ -107,7 +151,7 @@ def scan_item(text):
         row = None
 
     if isinstance(row, dict):
-        outside = " | ".join(str(v) for k, v in row.items() if k in OUTSIDE_TEXT_FIELDS)
+        outside = " | ".join(str(v) for k, v in row.items() if k in OUTSIDE_TEXT_FIELDS and v)
     else:
         outside = text
     if not outside.strip():
@@ -165,9 +209,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     # remember new payees, for the policy check on the next call
     if name == "add_payee" and pieces and "added" in pieces[0]:
-        session["new_payees"].add(str(args.get("payee_account", "")))
+        session["new_payees"].add(digits(args.get("payee_account", "")))
     if name == "transfer_funds" and pieces and pieces[0].startswith("Transferred"):
         session["total_sent"] += float(args.get("amount", 0) or 0)
+    if name == "pay_bill" and pieces and pieces[0].startswith("Paid"):
+        session["total_sent"] += float(re.search(r"\$([\d,]+\.\d\d)", pieces[0]).group(1).replace(",", ""))
 
     # 3. scan every piece of the result
     out, flagged = [], []

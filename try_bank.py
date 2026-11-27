@@ -41,24 +41,24 @@ async def main():
 
             # 2. Read some data
             print("\n=== get_balance ===")
-            print(text_of(await session.call_tool("get_balance", {"account_id": "ACC-1001"})))
+            print(text_of(await session.call_tool("get_balance", {"account_id": "acc_000001"})))
 
             print("\n=== list_transactions (first 3) ===")
             print(text_of(await session.call_tool("list_transactions",
-                                                  {"account_id": "ACC-1001", "limit": 3})))
+                                                  {"account_id": "acc_000001", "limit": 3})))
 
             # 3. Try paying a stranger directly -> should be refused
             print("\n=== transfer to a stranger (should fail) ===")
             print(text_of(await session.call_tool("transfer_funds",
-                  {"from_account": "ACC-1001", "to_account": "7731-0092", "amount": 1.0})))
+                  {"from_account": "acc_000001", "to_account": "7731-0092", "amount": 1.0})))
 
-            # 4. Pay the sister (a saved payee) -> should work
-            print("\n=== transfer $20 to sister (should work) ===")
+            # 4. Pay Jordan Lee (a saved payee) -> should work
+            print("\n=== transfer $20 to Jordan (should work) ===")
             print(text_of(await session.call_tool("transfer_funds",
-                  {"from_account": "ACC-1001", "to_account": "6602-1188", "amount": 20.0})))
+                  {"from_account": "acc_000001", "to_account": "6602118802", "amount": 20.0})))
 
             print("\n=== balance after ===")
-            print(text_of(await session.call_tool("get_balance", {"account_id": "ACC-1001"})))
+            print(text_of(await session.call_tool("get_balance", {"account_id": "acc_000001"})))
 
 
 if __name__ == "__main__":
