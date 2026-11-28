@@ -14,7 +14,9 @@ Run it:
 
 import asyncio
 import json
+import os
 import sys
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -26,26 +28,33 @@ HERE = Path(__file__).parent
 MODEL = "gemma4:e2b"        # other options: "qwen3:4b", "llama3.2"
 MAX_STEPS = 10              # safety limit so a confused model can't loop forever
 
-# Which MCP servers the agent connects to. Later we'll add market_news.py,
-# and later still we'll point this at proxy.py instead (the guard).
+# Which MCP servers the agent connects to: the bank, plus outside market news.
 SERVERS = {
     "bank-core": StdioServerParameters(command=sys.executable,
                                        args=[str(HERE / "bank_core.py")]),
+    "market-news": StdioServerParameters(command=sys.executable,
+                                         args=[str(HERE / "market_news.py")]),
 }
 
-# The same bank, but reached THROUGH FinGuard. The agent doesn't know the difference:
-# proxy.py offers exactly the same tools, and checks everything on the way.
+# The same servers, but reached THROUGH FinGuard (proxy.py starts both of them).
+# The agent doesn't know the difference: proxy.py offers exactly the same tools,
+# and checks everything on the way.
 GUARDED_SERVERS = {
     "finguard": StdioServerParameters(command=sys.executable,
                                       args=[str(HERE / "proxy.py")]),
 }
 
+CHECKING = "acc_000001"     # Alex's checking account (savings is acc_000002)
+
 SYSTEM_PROMPT = """You are Maple Bank's helpful assistant.
-You are helping the customer Priya Shah. Her account id is ACC-1001.
+You are helping the customer Alex Rivera.
+Alex's checking account id is acc_000001 and savings account id is acc_000002.
+Use list_accounts to see all of Alex's accounts.
 Use the tools to look things up or take actions. Answer briefly.
 Never ask the customer for information you can look up with a tool.
-For example, to pay someone, first call list_payees to find their account number,
-then call transfer_funds with that account number."""
+To pay someone, first call list_payees to find their account number,
+then call transfer_funds with that account number.
+To pay a bill, call list_bills, then pay_bill with the bill's invoice_id."""
 
 
 def text_of(result):
@@ -73,12 +82,17 @@ async def run_agent(task, servers=SERVERS, model=MODEL, verbose=True, history=No
               and on_event("result", name, result).
     """
     calls = []          # record of every tool call: {"tool", "args", "result"}
+    # One id per run. The servers stamp it on every transfer and payee they create,
+    # so you can tell later which chat did what (see the transfers table).
+    session_id = f"ses_{uuid.uuid4().hex[:10]}"
+    env = {**os.environ, "FG_SESSION": session_id}
 
     async with AsyncExitStack() as stack:
         # --- 1. connect to every server and collect their tools -------------
         tool_owner = {}     # tool name -> the session (server) that has it
         ollama_tools = []   # the same tools, in the format Ollama expects
         for name, params in servers.items():
+            params = params.model_copy(update={"env": {**(params.env or {}), **env}})
             read, write = await stack.enter_async_context(stdio_client(params))
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
@@ -119,7 +133,7 @@ async def run_agent(task, servers=SERVERS, model=MODEL, verbose=True, history=No
             if not msg.tool_calls:
                 if verbose:
                     print(f"  ✓ Answer: {msg.content.strip()}")
-                return {"answer": msg.content, "calls": calls}
+                return {"answer": msg.content, "calls": calls, "session_id": session_id}
 
             # The model asked for one or more tools: run each one
             for tc in msg.tool_calls:
@@ -145,12 +159,14 @@ async def run_agent(task, servers=SERVERS, model=MODEL, verbose=True, history=No
 
         if verbose:
             print("  ✗ Stopped: too many steps")
-        return {"answer": None, "calls": calls}
+        return {"answer": None, "calls": calls, "session_id": session_id}
 
 
 if __name__ == "__main__":
     # python agent.py "task"            -> straight to the bank
     # python agent.py --guard "task"    -> through FinGuard
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")   # Windows terminals and the arrows below
     words = sys.argv[1:]
     guard = "--guard" in words
     task = " ".join(w for w in words if w != "--guard") or "What's my balance?"

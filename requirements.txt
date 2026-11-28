@@ -3,3 +3,4 @@ ollama
 pyyaml
 streamlit
 pandas
+faker
