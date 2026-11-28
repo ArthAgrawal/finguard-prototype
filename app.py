@@ -21,6 +21,7 @@ import yaml
 
 import agent
 import bank_core
+import market_news
 from seed import DB_PATH, build_bank
 
 ACCOUNT = "ACC-1001"
@@ -48,6 +49,8 @@ if "chat" not in st.session_state:
     st.session_state.chat = []      # list of {"role", "content", "calls"}
 if "scenario" not in st.session_state:
     st.session_state.scenario = "None"   # which attack is planted right now
+if "variants" not in st.session_state:
+    st.session_state.variants = {}       # e.g. {"market-news": "poisoned"}
 
 AUDIT_LOG = Path(__file__).parent / "finguard_audit.jsonl"
 PENDING = Path(__file__).parent / "finguard_pending.json"
@@ -91,8 +94,9 @@ with st.sidebar:
         st.caption(f"**Try asking:** *{atk['try_asking']}*")
 
     if st.button("Reset bank with this scenario", width="stretch", type="primary"):
-        plants = [] if choice == "None" else ATTACKS[choice]["plants"]
-        build_bank(plants=plants)          # rebuild clean, then hide the attack text
+        atk = {} if choice == "None" else ATTACKS[choice]
+        build_bank(plants=atk.get("plants", []))   # rebuild clean, then hide attack text in data
+        st.session_state.variants = atk.get("server_variants", {})  # or start a poisoned server
         AUDIT_LOG.unlink(missing_ok=True)  # fresh FinGuard log too
         PENDING.unlink(missing_ok=True)    # and no leftover approval requests
         st.session_state.scenario = choice
@@ -109,9 +113,13 @@ with st.sidebar:
     else:
         st.warning(f"Active: {ATTACKS[active]['name']}")
         with st.expander("Show the planted text"):
-            for p in ATTACKS[active]["plants"]:
-                st.caption(f"{p['table']} · {p['id']} · {p['field']}")
+            for p in ATTACKS[active].get("plants", []):
+                st.caption(f"data: {p['table']} · {p['id']} · {p['field']}")
                 st.code(p["text"], language=None, wrap_lines=True)
+            if st.session_state.variants.get("market-news") == "poisoned":
+                st.caption("tool description: market-news · get_fx_rate")
+                st.code(market_news.FX_DESCRIPTIONS["poisoned"], language=None,
+                        wrap_lines=True)
     st.caption(f"Model: `{agent.MODEL}`")
 
     st.divider()
@@ -212,7 +220,8 @@ def show_calls(calls):
 
 with right:
     st.subheader("💬 Assistant")
-    st.caption("Ask about your account, bills or payments. Try: *Send $20 to my sister Anika*")
+    st.caption("Ask about your account, bills, payments, news or exchange rates. "
+               "Try: *Send $20 to my sister Anika*")
 
     for m in st.session_state.chat:
         with st.chat_message(m["role"]):
@@ -253,7 +262,8 @@ with right:
                             st.caption("　↳ got a reply from the bank")
 
                 try:
-                    servers = agent.GUARDED_SERVERS if guard_on else agent.SERVERS
+                    servers = agent.make_servers(guard=guard_on,
+                                                 variants=st.session_state.variants)
                     result = asyncio.run(agent.run_agent(prompt, verbose=False,
                                                          history=history,
                                                          on_event=on_event,

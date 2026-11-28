@@ -21,6 +21,7 @@ One run of the agent = one session = one fresh memory (new_payees, etc.).
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -37,10 +38,14 @@ HERE = Path(__file__).parent
 AUDIT_LOG = HERE / "finguard_audit.jsonl"
 PENDING = HERE / "finguard_pending.json"    # actions waiting for the customer's approval
 
-# The real servers FinGuard protects (later: add market_news.py here)
+# The real servers FinGuard protects.
+# The market-news variant is passed through, so tests can start a poisoned one.
 DOWNSTREAM = {
     "bank-core": StdioServerParameters(command=sys.executable,
                                        args=[str(HERE / "bank_core.py")]),
+    "market-news": StdioServerParameters(
+        command=sys.executable, args=[str(HERE / "market_news.py")],
+        env={"MARKET_NEWS_VARIANT": os.environ.get("MARKET_NEWS_VARIANT", "clean")}),
 }
 
 # Which fields hold text written by OUTSIDERS (the only text we need to scan)
